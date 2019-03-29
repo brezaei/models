@@ -17,6 +17,7 @@
 
 import numpy as np
 import tensorflow as tf
+import tensorflow.contrib.slim as slim
 
 from tensorflow.python.platform import app
 from tensorflow.python.platform import flags
@@ -44,7 +45,6 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string('data_dir', DATA_DIR, 'directory containing data.')
 flags.DEFINE_string('output_dir', OUT_DIR, 'directory for model checkpoints.')
 flags.DEFINE_string('event_log_dir', OUT_DIR, 'directory for writing summary.')
-flags.DEFINE_integer('num_iterations', 100000, 'number of training iterations.')
 flags.DEFINE_string('pretrained_model', '',
                     'filepath of a pretrained model to initialize from.')
 
@@ -69,6 +69,27 @@ flags.DEFINE_float('train_val_split', 0.95,
 flags.DEFINE_integer('batch_size', 32, 'batch size for training')
 flags.DEFINE_float('learning_rate', 0.001,
                    'the base learning rate of the generator')
+
+# Stochastic model flags
+flags.DEFINE_bool('stochastic_model', False,
+                  'Whether or not to use stochastic arcitecture.')
+flags.DEFINE_bool('inference_time', False,
+                  'Whether or not to construct the latent tower.')
+flags.DEFINE_bool('multi_latent', False,
+                  'Whether or not to sample the latent every timestep.')
+flags.DEFINE_float('latent_std_min', -5.0,
+                   'Minimum for log(std) of latent distribution.')
+flags.DEFINE_float('latent_loss_multiplier', 1e-5,
+                   'Multiplier of KL-loss.')
+flags.DEFINE_integer('latent_channels', 1,
+                     'Number of channels in latent tensor.')
+flags.DEFINE_integer('tfrecord_format', 0, '0 for google, 1 for berkeley')
+flags.DEFINE_integer('num_iterations_1st_stage', 100000,
+                     'Number of iterations in first training stage (deterministic).')
+flags.DEFINE_integer('num_iterations_2nd_stage', 50000,
+                     'Number of iterations in second training stage (no KL loss).')
+flags.DEFINE_integer('num_iterations_3rd_stage', 50000,
+                     'Number of iterations in third training stage.')
 
 
 ## Helper functions
@@ -124,7 +145,7 @@ class Model(object):
     images = [tf.squeeze(img) for img in images]
 
     if reuse_scope is None:
-      gen_images, gen_states = construct_model(
+      gen_images, gen_states, latent_loss = construct_model(
           images,
           actions,
           states,
@@ -138,7 +159,7 @@ class Model(object):
           context_frames=FLAGS.context_frames)
     else:  # If it's a validation or test model.
       with tf.variable_scope(reuse_scope, reuse=True):
-        gen_images, gen_states = construct_model(
+        gen_images, gen_states, latent_loss = construct_model(
             images,
             actions,
             states,
@@ -174,9 +195,28 @@ class Model(object):
     summaries.append(tf.summary.scalar(prefix + '_psnr_all', psnr_all))
     self.psnr_all = psnr_all
 
-    self.loss = loss = loss / np.float32(len(images) - FLAGS.context_frames)
+    loss_mse = loss / np.float32(len(images) - FLAGS.context_frames)
+    loss = loss_mse
+    if FLAGS.stochastic_model:
+      values = [0.0, FLAGS.latent_loss_multiplier]
+      # KL loss is zero till 3rd stage
+      boundaries = [FLAGS.num_iterations_1st_stage + FLAGS.num_iterations_2nd_stage]
+      latent_multiplier = tf.train.piecewise_constant(
+          tf.cast(self.iter_num, tf.int32),
+          boundaries, values)
+      loss += latent_multiplier * latent_loss
+      summaries.append(tf.summary.scalar(prefix + '_loss_latent', latent_loss))
+    
+    self.loss = loss
+
+    self.images = images
+    self.gen_images = gen_images
 
     summaries.append(tf.summary.scalar(prefix + '_loss', loss))
+    summaries.append(tf.summary.scalar(prefix + '_loss_mse', loss_mse))
+    
+    summaries.append(tf.summary.image(prefix + '_real', images[-1]))
+    summaries.append(tf.summary.image(prefix + '_gen', gen_images[-1]))
 
     self.lr = tf.placeholder_with_default(FLAGS.learning_rate, ())
 
@@ -188,12 +228,12 @@ def main(unused_argv):
 
   print('Constructing models and inputs.')
   with tf.variable_scope('model', reuse=None) as training_scope:
-    images, actions, states = build_tfrecord_input(training=True)
+    images, actions, states = build_tfrecord_input(training=True, tfrecord_format=FLAGS.tfrecord_format)
     model = Model(images, actions, states, FLAGS.sequence_length,
                   prefix='train')
 
   with tf.variable_scope('val_model', reuse=None):
-    val_images, val_actions, val_states = build_tfrecord_input(training=False)
+    val_images, val_actions, val_states = build_tfrecord_input(training=False, tfrecord_format=FLAGS.tfrecord_format)
     val_model = Model(val_images, val_actions, val_states,
                       FLAGS.sequence_length, training_scope, prefix='val')
 
@@ -217,7 +257,8 @@ def main(unused_argv):
   tf.logging.info('iteration number, cost')
 
   # Run training.
-  for itr in range(FLAGS.num_iterations):
+  num_iterations = FLAGS.num_iterations_1st_stage + FLAGS.num_iterations_2nd_stage + FLAGS.num_iterations_3rd_stage
+  for itr in range(num_iterations):
     # Generate new batch of data.
     feed_dict = {model.iter_num: np.float32(itr),
                  model.lr: FLAGS.learning_rate}
